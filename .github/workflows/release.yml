@@ -1,0 +1,244 @@
+name: Release
+
+# The source stays private in myhau/blinkpaste. This public repository owns the
+# hosted runner because the myhau account currently has no private Actions
+# budget. An Ubuntu planning job checks whether private main has changed; macOS
+# only starts when there is a new source commit to build.
+#
+# Required repository secrets:
+#   SOURCE_REPO_TOKEN            myhau token with read access to private source
+#   MACOS_CERTIFICATE_P12        base64-encoded Developer ID Application .p12
+#   MACOS_CERTIFICATE_PASSWORD   password for the .p12
+#   ASC_API_KEY_P8               App Store Connect API key (.p8 contents)
+#   ASC_API_KEY_ID               App Store Connect API key ID
+#   ASC_API_ISSUER_ID            App Store Connect API issuer ID
+#   RELEASES_REPO_TOKEN          mike-the-brain token with contents:write here
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Release even if this private source SHA was already published
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    - cron: "17 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Check private main
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      needs_release: ${{ steps.plan.outputs.needs_release }}
+      source_sha: ${{ steps.plan.outputs.source_sha }}
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: myhau/blinkpaste
+          ref: main
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          path: source
+
+      - name: Plan release
+        id: plan
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          FORCE_RELEASE: ${{ inputs.force || false }}
+        run: |
+          SOURCE_SHA="$(git -C source rev-parse HEAD)"
+          BASE="$(tr -d '[:space:]' < source/VERSION)"
+          VERSION="${BASE}.${{ github.run_number }}"
+          if [[ "$FORCE_RELEASE" == "true" ]]; then
+            EXISTING=""
+            echo "Forced release requested"
+          else
+            EXISTING="$(
+              gh api --paginate repos/chasing-brains/blinkpaste-releases/releases \
+                | jq -r --arg sha "$SOURCE_SHA" \
+                  '.[] | select((.body // "") | contains($sha)) | .html_url' \
+                | head -n1
+            )"
+          fi
+
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [[ -n "$EXISTING" ]]; then
+            echo "needs_release=false" >> "$GITHUB_OUTPUT"
+            echo "Already released: $EXISTING"
+          else
+            echo "needs_release=true" >> "$GITHUB_OUTPUT"
+            echo "Will release private source $SOURCE_SHA as $VERSION"
+          fi
+
+  release:
+    name: Build, sign, notarize, publish
+    needs: plan
+    if: needs.plan.outputs.needs_release == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: myhau/blinkpaste
+          ref: ${{ needs.plan.outputs.source_sha }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          path: source
+
+      - name: Verify release publisher
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+        run: |
+          test "$(gh api user --jq .login)" = "mike-the-brain"
+          test "$(gh api repos/chasing-brains/blinkpaste-releases --jq .permissions.push)" = "true"
+
+      - name: Import signing certificate
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          test -n "$MACOS_CERTIFICATE_P12"
+          test -n "$MACOS_CERTIFICATE_PASSWORD"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          printf '%s' "$MACOS_CERTIFICATE_P12" | base64 -d > "$RUNNER_TEMP/cert.p12"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$RUNNER_TEMP/cert.p12" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+          rm "$RUNNER_TEMP/cert.p12"
+
+      - name: Build and sign universal app
+        working-directory: source
+        env:
+          BLINKPASTE_VERSION: ${{ needs.plan.outputs.version }}
+          BLINKPASTE_BUILD_NUMBER: ${{ github.run_number }}
+        run: ./build.sh --universal
+
+      - name: Verify Developer ID signature
+        run: |
+          ARCHS="$(lipo -archs source/dist/BlinkPaste.app/Contents/MacOS/BlinkPaste)"
+          grep -q arm64 <<< "$ARCHS"
+          grep -q x86_64 <<< "$ARCHS"
+          codesign --verify --strict --verbose=2 source/dist/BlinkPaste.app
+          codesign -dvv source/dist/BlinkPaste.app 2>&1 | grep -q \
+            "Authority=Developer ID Application: Michal Fudala (KLH79H3F9W)"
+
+      - name: Notarize app, staple it, and package notarized DMG
+        env:
+          ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+          ASC_API_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
+          ASC_API_ISSUER_ID: ${{ secrets.ASC_API_ISSUER_ID }}
+        run: |
+          test -n "$ASC_API_KEY_P8"
+          test -n "$ASC_API_KEY_ID"
+          test -n "$ASC_API_ISSUER_ID"
+          KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
+          printf '%s\n' "$ASC_API_KEY_P8" > "$KEY_PATH"
+
+          # Notarize the signed app inside its ZIP, then staple the app itself.
+          xcrun notarytool submit source/dist/BlinkPaste.zip \
+            --key "$KEY_PATH" \
+            --key-id "$ASC_API_KEY_ID" \
+            --issuer "$ASC_API_ISSUER_ID" \
+            --wait
+          xcrun stapler staple source/dist/BlinkPaste.app
+          xcrun stapler validate source/dist/BlinkPaste.app
+
+          # Rebuild both distributable containers from the stapled app.
+          rm source/dist/BlinkPaste.zip
+          ditto -c -k --keepParent \
+            source/dist/BlinkPaste.app \
+            source/dist/BlinkPaste.zip
+
+          DMG_STAGE="$RUNNER_TEMP/blinkpaste-dmg"
+          rm -rf "$DMG_STAGE"
+          mkdir -p "$DMG_STAGE"
+          ditto source/dist/BlinkPaste.app "$DMG_STAGE/BlinkPaste.app"
+          ln -s /Applications "$DMG_STAGE/Applications"
+          hdiutil create \
+            -volname BlinkPaste \
+            -srcfolder "$DMG_STAGE" \
+            -ov \
+            -format UDZO \
+            source/dist/BlinkPaste.dmg
+
+          DMG_IDENTITY="$(
+            security find-identity -p codesigning -v \
+              | sed -nE 's/^ *[0-9]+\) +[0-9A-F]{40} +"(Developer ID Application: [^"]*)"/\1/p' \
+              | head -n1
+          )"
+          test -n "$DMG_IDENTITY"
+          codesign --force --timestamp \
+            --sign "$DMG_IDENTITY" \
+            source/dist/BlinkPaste.dmg
+          codesign --verify --strict --verbose=2 source/dist/BlinkPaste.dmg
+
+          xcrun notarytool submit source/dist/BlinkPaste.dmg \
+            --key "$KEY_PATH" \
+            --key-id "$ASC_API_KEY_ID" \
+            --issuer "$ASC_API_ISSUER_ID" \
+            --wait
+          xcrun stapler staple source/dist/BlinkPaste.dmg
+          xcrun stapler validate source/dist/BlinkPaste.dmg
+          rm "$KEY_PATH"
+
+      - name: Gate release on signature, tickets, and Gatekeeper
+        run: |
+          codesign --verify --strict --verbose=2 source/dist/BlinkPaste.app
+          codesign --verify --strict --verbose=2 source/dist/BlinkPaste.dmg
+          xcrun stapler validate source/dist/BlinkPaste.app
+          xcrun stapler validate source/dist/BlinkPaste.dmg
+          spctl --assess --type execute --verbose=4 source/dist/BlinkPaste.app
+          spctl --assess \
+            --type open \
+            --context context:primary-signature \
+            --verbose=4 \
+            source/dist/BlinkPaste.dmg
+          hdiutil verify source/dist/BlinkPaste.dmg
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          SOURCE_SHA: ${{ needs.plan.outputs.source_sha }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          SUBJECT="$(git -C source log -1 --format='%s')"
+          # The backticks in the single-quoted format are literal Markdown.
+          # shellcheck disable=SC2016
+          printf 'Built from private source `myhau/blinkpaste@%s`.\n\n%s\n' \
+            "$SOURCE_SHA" "$SUBJECT" > "$RUNNER_TEMP/release-notes.md"
+          gh release create "v$VERSION" \
+            source/dist/BlinkPaste.dmg \
+            source/dist/BlinkPaste.zip \
+            --repo chasing-brains/blinkpaste-releases \
+            --latest \
+            --title "BlinkPaste $VERSION" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BlinkPaste-${{ needs.plan.outputs.version }}
+          path: |
+            source/dist/BlinkPaste.dmg
+            source/dist/BlinkPaste.zip
+          if-no-files-found: error
